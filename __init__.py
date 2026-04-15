@@ -53,7 +53,7 @@ for module in DEPENDENCIES:
         importlib.import_module(module)
     except ImportError:
         if module == "igl":
-            missing_deps.append("libigl==2.5.1")
+            missing_deps.append("libigl==2.6.1")
         else:
             missing_deps.append(module)
 
@@ -700,13 +700,13 @@ class InstallDependencies(bpy.types.Operator):
             constraints_path = os.path.join(os.path.dirname(__file__), "constraints.txt")
             with open(constraints_path, "w") as f:
                 f.write(f"numpy=={np.__version__}\n")
-                f.write(f"robust_laplacian==1.0.0\n") 
+                f.write(f"robust_laplacian==1.1.0\n")
 
             # we do a pip user install under a custom user base path
             # makes use of existing installed python packages like numpy, still uses pips dependency resolution and keeps it isolated
             env = os.environ.copy()
             env["PYTHONUSERBASE"] = libs_path
-            subprocess.check_call([python_exe, "-m", "pip", "install", "--user", *missing_deps, "--break-system-packages", "-c", constraints_path], env=env)
+            subprocess.check_call([python_exe, "-m", "pip", "install", "--user", "--only-binary=:all:", *missing_deps, "--break-system-packages", "-c", constraints_path], env=env)
             self.report({'INFO'}, "Installation successful! Please restart Blender.")
             global installed_deps
             installed_deps = True
