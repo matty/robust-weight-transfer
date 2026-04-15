@@ -79,7 +79,7 @@ def get_groups_arr(obj: bpy.types.Object, include_groups: list[bool]=None):
     return arr
 
 
-def draw_debug_vertex_colors(obj, matched):
+def draw_debug_vertex_colors(obj, matched, exact=None):
     mesh: bpy.types.Mesh = obj.data
     if not isinstance(mesh, bpy.types.Mesh): return
 
@@ -93,7 +93,10 @@ def draw_debug_vertex_colors(obj, matched):
     mesh.loops.foreach_get('vertex_index', loop_ind)
     loop_matched = matched[loop_ind]
     color_data = np.ones((len(mesh.loops), 4), dtype=np.float32)
-    color_data[~loop_matched] = [234/255, 0, 255/255, 1.0]
+    color_data[~loop_matched] = [234/255, 0, 255/255, 1.0]  # magenta = unmatched
+    if exact is not None:
+        loop_exact = exact[loop_ind]
+        color_data[loop_exact] = [0.0, 0.4, 1.0, 1.0]  # blue = exact-matched
     color_layer.data.foreach_set("color", color_data.reshape(-1))
     mesh.update()
     mesh.vertex_colors.active = color_layer

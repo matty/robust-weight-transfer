@@ -120,7 +120,76 @@ def normalize_vec(v):
     return v/np.linalg.norm(v)
 
 
-def find_matches_closest_surface(source_verts, source_triangles, source_normals, target_verts, target_normals, source_weights, dDISTANCE_THRESHOLD_SQRD, dANGLE_THRESHOLD_DEGREES, flip_vertex_normal):
+def find_exact_vertex_matches(
+    source_verts,
+    source_normals,
+    target_verts,
+    target_normals,
+    exact_match_distance,
+    angle_threshold_degrees,
+    flip_vertex_normal,
+):
+    """
+    Locate target vertices that coincide with a source vertex.
+
+    For each target vertex, queries the nearest source vertex within
+    `exact_match_distance` (world units). A hit additionally requires the
+    source and target vertex normals to agree within `angle_threshold_degrees`
+    (optionally mirroring through 180° when `flip_vertex_normal` is True).
+
+    Args:
+        source_verts:         (#S, 3) source vertex positions (world-space).
+        source_normals:       (#S, 3) source vertex normals (any length; normalized internally).
+        target_verts:         (#T, 3) target vertex positions (world-space).
+        target_normals:       (#T, 3) target vertex normals (any length; normalized internally).
+        exact_match_distance: scalar; 0 disables (returns all-False hit mask).
+        angle_threshold_degrees: scalar; max allowed angle between normals.
+        flip_vertex_normal:   bool; if True, normals 180° apart also qualify.
+
+    Returns:
+        hit:     (#T,) bool array — True where the target matched a source vertex.
+        src_idx: (#hit,) int array — source-vertex index for each True in `hit`,
+                 in target order. Length == hit.sum().
+    """
+    num_targets = target_verts.shape[0]
+    if exact_match_distance <= 0.0 or num_targets == 0 or source_verts.shape[0] == 0:
+        return np.zeros(num_targets, dtype=bool), np.zeros(0, dtype=np.int64)
+
+    tree = sp.spatial.cKDTree(source_verts)
+    dists, idxs = tree.query(target_verts, distance_upper_bound=float(exact_match_distance))
+    candidate = np.isfinite(dists)
+    if not np.any(candidate):
+        return np.zeros(num_targets, dtype=bool), np.zeros(0, dtype=np.int64)
+
+    cand_src = idxs[candidate]
+    sn = source_normals[cand_src].astype(np.float64, copy=False)
+    tn = target_normals[candidate].astype(np.float64, copy=False)
+
+    sn_len = np.linalg.norm(sn, axis=1)
+    tn_len = np.linalg.norm(tn, axis=1)
+    valid = (sn_len > 0) & (tn_len > 0)  # degenerate zero normals cannot match
+    # Safe divisors for the division; the `valid` mask zeroes out the bad rows below.
+    sn_unit = sn / np.where(sn_len[:, None] == 0, 1.0, sn_len[:, None])
+    tn_unit = tn / np.where(tn_len[:, None] == 0, 1.0, tn_len[:, None])
+
+    dot = np.einsum('ij,ij->i', sn_unit, tn_unit)
+    dot = np.clip(dot, -1.0, 1.0)
+    deg = np.degrees(np.arccos(dot))
+    passes = deg <= angle_threshold_degrees
+    if flip_vertex_normal:
+        passes = np.logical_or(passes, (180.0 - deg) <= angle_threshold_degrees)
+    passes = passes & valid
+
+    hit = np.zeros(num_targets, dtype=bool)
+    cand_indices = np.where(candidate)[0]
+    hit_indices = cand_indices[passes]
+    hit[hit_indices] = True
+
+    src_idx = cand_src[passes].astype(np.int64)
+    return hit, src_idx
+
+
+def find_matches_closest_surface(source_verts, source_triangles, source_normals, target_verts, target_normals, source_weights, dDISTANCE_THRESHOLD_SQRD, dANGLE_THRESHOLD_DEGREES, flip_vertex_normal, exact_match_distance=0.0):
     """
     For each vertex on the target mesh find a match on the source mesh.
 
@@ -141,7 +210,16 @@ def find_matches_closest_surface(source_verts, source_triangles, source_normals,
     Returns:
         Matched: #V2 array of bools, where Matched[i] is True if we found a good match for vertex i on the source mesh
         W2: #V2 by num_bones, where W2[i,:] are skinning weights copied directly from source using closest point method
+        exact_hit: #V2 array of bools, where exact_hit[i] is True if the match came from the exact-match fast path (always all-False when the feature is disabled)
     """
+    exact_hit, exact_src_idx = find_exact_vertex_matches(
+        source_verts, source_normals,
+        target_verts, target_normals,
+        exact_match_distance,
+        dANGLE_THRESHOLD_DEGREES,
+        flip_vertex_normal,
+    )
+
     sqrD,I,C,B = find_closest_point_on_surface(target_verts,source_verts,source_triangles)
     
     # for each closest point on the source, interpolate its per-vertex attributes(skin weights and normals) 
@@ -166,8 +244,12 @@ def find_matches_closest_surface(source_verts, source_triangles, source_normals,
         deg_angles_mirror = 180 - deg_angles
         is_deg_threshold = np.logical_or(is_deg_threshold, deg_angles_mirror <= angle_thresholds)
 
-    Matched = np.logical_and(is_distance_threshold, is_deg_threshold)    
-    return Matched, W2
+    Matched = np.logical_and(is_distance_threshold, is_deg_threshold)
+
+    W2[exact_hit] = source_weights[exact_src_idx]
+    Matched[exact_hit] = True
+
+    return Matched, W2, exact_hit
 
 
 def connected_components_split(F, num_verts):

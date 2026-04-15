@@ -131,7 +131,9 @@ class RobustWeightTransfer(bpy.types.Operator):
         for obj in target_objs:
             object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
             verts, triangles, normals = util.get_obj_arrs_world(obj.evaluated_get(depsgraph) if scene_settings.use_deformed_target else obj)
-            matched_verts, weights = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal)
+            matched_verts, weights, exact_hit = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal, scene_settings.get_exact_match_distance())
+            if scene_settings.prefer_exact_match:
+                self.report({'INFO'}, f'{obj.name}: exact-matched {int(exact_hit.sum())} of {exact_hit.shape[0]} verts')
             if not scene_settings.apply_to_selected:
                 if util.is_group_valid(obj.vertex_groups, object_settings.inpaint_group):
                     inpaint_mask = util.get_group_arr(obj, object_settings.inpaint_group)
@@ -139,10 +141,10 @@ class RobustWeightTransfer(bpy.types.Operator):
                     if object_settings.inpaint_group_invert:
                         inpaint_mask_bin = ~inpaint_mask_bin
                     matched_verts = np.logical_and(matched_verts, ~inpaint_mask_bin)
-            
-            
+
+
             if scene_settings.draw_matched:
-                res = util.draw_debug_vertex_colors(obj, matched_verts)
+                res = util.draw_debug_vertex_colors(obj, matched_verts, exact=exact_hit)
                 if not res:
                     self.report({'ERROR'}, f'{obj.name} has too many vertex colors. Delete one or deactive Visualize Rejected Weights.')
                     return {'CANCELLED'}
@@ -254,8 +256,8 @@ class SelectNonMatched(bpy.types.Operator):
         
         obj = context.active_object
         verts, triangles, normals = util.get_obj_arrs_world(obj.evaluated_get(depsgraph) if scene_settings.use_deformed_target else obj)
-        matched_verts, weights = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal)
-        
+        matched_verts, weights, _ = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal, scene_settings.get_exact_match_distance())
+
         if not scene_settings.apply_to_selected:
             object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
             has_inpaint = len(object_settings.inpaint_group) > 0 and object_settings.inpaint_group in obj.vertex_groups
@@ -436,6 +438,20 @@ class SceneSettingsGroup(bpy.types.PropertyGroup):
         name='Isolate Loose Parts',
         description='Inpaint each connected mesh island independently so weights cannot bleed between disconnected parts that happen to be close in space (e.g. left and right sock). Mainly affects Point inpaint mode',
         default=False)
+    prefer_exact_match: bpy.props.BoolProperty(
+        name='Prefer Exact Match',
+        description='When a target vertex lies exactly on a source vertex (within Exact Match Distance) and its normal agrees, copy that source vertex\'s weights directly instead of projecting onto the surface. Preserves weights bit-exactly wherever topology coincides',
+        default=False)
+    exact_match_distance: bpy.props.FloatProperty(
+        name='Exact Match Distance',
+        description='Maximum world-space distance for two vertices to be considered coincident for the exact-match fast path',
+        default=1e-4,
+        min=0.0,
+        precision=6,
+        unit='LENGTH')
+    def get_exact_match_distance(self):
+        return self.exact_match_distance if self.prefer_exact_match else 0.0
+
     smooth_limit_debug: bpy.props.BoolProperty(
         name='Limited vertices to Vertex Group',
         description='Visualize the vertices that got limited by writing to the "Limited" vertex group',
@@ -560,6 +576,10 @@ class SettingsPanel(bpy.types.Panel):
         layout.operator('object.rbt_reset_scene_settings', icon='LOOP_BACK', text='Reset to Defaults')
         layout.prop(settings, 'inpaint_mode')
         layout.prop(settings, 'isolate_loose_parts')
+        layout.prop(settings, 'prefer_exact_match')
+        row = layout.row()
+        row.enabled = settings.prefer_exact_match
+        row.prop(settings, 'exact_match_distance')
         layout.prop(settings, 'draw_matched')
         row = layout.row()
         row.enabled = not settings.enforce_four_bone_limit
