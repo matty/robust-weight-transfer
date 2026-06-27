@@ -76,7 +76,12 @@ def find_closest_point_on_surface(P, V, F):
     V2 = V[F_closest[:,1],:]
     V3 = V[F_closest[:,2],:]
 
-    B = igl.barycentric_coordinates_tri(C, V1, V2, V3)
+    # libigl renamed `barycentric_coordinates_tri` to `barycentric_coordinates`
+    # in newer builds (shipped with Blender 5.1+ / Python 3.12). Support both.
+    if hasattr(igl, "barycentric_coordinates_tri"):
+        B = igl.barycentric_coordinates_tri(C, V1, V2, V3)
+    else:
+        B = igl.barycentric_coordinates(C, V1, V2, V3)
 
     return sqrD,I,C,B
 
