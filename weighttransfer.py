@@ -250,13 +250,19 @@ def inpaint(V2, F2, W2, Matched, point_cloud):
     Q2 = Q2.astype(np.float64)
 
     Aeq = sp.sparse.csc_matrix((0, 0), dtype=np.float64)
-    Beq = np.array([], dtype=np.float64)
+    # newer libigl (2.6+) requires Beq as a 2D array; older accepted 1D
+    Beq = np.zeros((0, W2.shape[1]), dtype=np.float64)
     B = np.zeros(shape = (L.shape[0], W2.shape[1]), dtype=np.float64)
 
     b = np.array(range(0, int(V2.shape[0])), dtype=np.int64)
     b = b[Matched]
     bc = W2[Matched,:].astype(np.float64)
-    result, W_inpainted = igl.min_quad_with_fixed(Q2, B, b, bc, Aeq, Beq, True)
+    # old libigl returned (ok, Z); newer libigl (2.6+) returns Z directly
+    res = igl.min_quad_with_fixed(Q2, B, b, bc, Aeq, Beq, True)
+    if isinstance(res, tuple):
+        result, W_inpainted = res
+    else:
+        result, W_inpainted = True, res
     W_inpainted = W_inpainted.astype(np.float32)
     # when W2 shape = (num_verts, 1), it gets flattened to (num_verts, )
     # reshape it back to initial shape, limit_mask expects 2d array
