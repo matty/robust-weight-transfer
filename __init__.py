@@ -39,6 +39,8 @@ import webbrowser
 import math
 import importlib
 import subprocess
+import threading
+import queue
 import bpy.utils.previews
 
 libs_path = os.path.join(os.path.dirname(__file__), 'deps')
@@ -53,11 +55,17 @@ for module in DEPENDENCIES:
         importlib.import_module(module)
     except ImportError:
         if module == "igl":
-            missing_deps.append("libigl==2.5.1")
+            # Blender 5.1+ ships Python 3.12 / numpy 2.x. libigl 2.5.1 predates
+            # numpy 2 (ABI-incompatible), and 2.6.2 ships no Windows wheel (would
+            # try to build from source and fail). 2.6.1 has a cp312-abi3 wheel for
+            # win/mac/linux and uses the new API that weighttransfer.py handles.
+            missing_deps.append("libigl==2.6.1")
         else:
             missing_deps.append(module)
 
 installed_deps = False
+install_running = False   # True while the modal pip install is in progress
+install_status = ""       # latest line of progress shown in the panel
 
 print(missing_deps)
 
@@ -463,16 +471,21 @@ class RobustWeightTransferPanel(bpy.types.Panel):
         if missing_deps:
             box = layout.box()
             col = box.column()
-            global installed_deps
+            global installed_deps, install_running, install_status
             if installed_deps:
                 col.label(text="Dependencies installed!", icon='INFO')
                 col.label(text="Restart Blender!", icon='ERROR')
-                installed_deps = True
                 return
-            
-            col.label(text="Blender will be unreactive while installing")
+
+            if install_running:
+                col.label(text="Installing dependencies...", icon='SORTTIME')
+                if install_status:
+                    col.label(text=install_status)
+                col.label(text="You can keep using Blender.", icon='INFO')
+                return
+
             col.operator("wm.install_rwt_dependencies", icon='IMPORT')
-            col.label(text="This might take a few minutes", icon='INFO')
+            col.label(text="Runs in the background (a few minutes).", icon='INFO')
             return
 
         active_obj = context.object
@@ -691,29 +704,120 @@ class InstallDependencies(bpy.types.Operator):
     """Install missing Python dependencies"""
     bl_idname = "wm.install_rwt_dependencies"
     bl_label = "Install Dependencies"
-    
-    def execute(self, context):
+
+    _SPINNER = "|/-\\"
+
+    _timer = None
+    _thread = None
+    _queue = None
+    _spin = 0
+    _last_line = "Starting pip..."
+
+    def _run_pip(self, cmd, env, q):
+        """Runs in a background thread. Never touches bpy (not thread-safe)."""
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                # don't pop up a console window on Windows
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    q.put(("log", line))
+            proc.wait()
+            q.put(("done", proc.returncode))
+        except Exception as e:  # pip missing, bad executable, etc.
+            q.put(("error", str(e)))
+
+    def invoke(self, context, event):
         python_exe = sys.executable
         print(python_exe)
-        try:
-            # create a constraints.txt to constrain the dependency install to the numpy version that blender ships with
-            constraints_path = os.path.join(os.path.dirname(__file__), "constraints.txt")
-            with open(constraints_path, "w") as f:
-                f.write(f"numpy=={np.__version__}\n")
-                f.write(f"robust_laplacian==1.0.0\n") 
 
-            # we do a pip user install under a custom user base path
-            # makes use of existing installed python packages like numpy, still uses pips dependency resolution and keeps it isolated
-            env = os.environ.copy()
-            env["PYTHONUSERBASE"] = libs_path
-            subprocess.check_call([python_exe, "-m", "pip", "install", "--user", *missing_deps, "--break-system-packages", "-c", constraints_path], env=env)
-            self.report({'INFO'}, "Installation successful! Please restart Blender.")
-            global installed_deps
-            installed_deps = True
-            return {'FINISHED'}
-        except subprocess.CalledProcessError as e:
-            self.report({'ERROR'}, f"Installation failed: {str(e)}")
-            return {'CANCELLED'}
+        # constrain the install to the numpy version Blender ships with
+        constraints_path = os.path.join(os.path.dirname(__file__), "constraints.txt")
+        with open(constraints_path, "w") as f:
+            f.write(f"numpy=={np.__version__}\n")
+            f.write("robust_laplacian==1.0.0\n")
+
+        # pip user install under a custom user base path: reuses Blender's
+        # bundled packages (e.g. numpy) while keeping our deps isolated
+        env = os.environ.copy()
+        env["PYTHONUSERBASE"] = libs_path
+        cmd = [python_exe, "-m", "pip", "install", "--user", *missing_deps,
+               "--break-system-packages", "-c", constraints_path]
+
+        global install_running, install_status
+        install_running = True
+        self._last_line = "Starting pip..."
+        self._spin = 0
+        install_status = self._last_line
+
+        self._queue = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run_pip, args=(cmd, env, self._queue), daemon=True)
+        self._thread.start()
+
+        wm = context.window_manager
+        # poll the worker thread on a timer; Blender stays responsive meanwhile
+        self._timer = wm.event_timer_add(0.15, window=context.window)
+        wm.modal_handler_add(self)
+        self._tag_redraw(context)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        global install_running, install_status, installed_deps
+        try:
+            while True:
+                kind, payload = self._queue.get_nowait()
+                if kind == "log":
+                    self._last_line = payload[:70]
+                elif kind == "done":
+                    self._finish(context)
+                    install_running = False
+                    install_status = ""
+                    if payload == 0:
+                        installed_deps = True
+                        self.report({'INFO'}, "Installation successful! Please restart Blender.")
+                        return {'FINISHED'}
+                    self.report({'ERROR'}, f"Installation failed (pip exit {payload}). See system console.")
+                    return {'CANCELLED'}
+                elif kind == "error":
+                    self._finish(context)
+                    install_running = False
+                    install_status = ""
+                    print(payload)
+                    self.report({'ERROR'}, f"Installation failed: {payload}")
+                    return {'CANCELLED'}
+        except queue.Empty:
+            pass
+
+        # animate so the panel shows liveness even between sparse pip lines
+        self._spin = (self._spin + 1) % len(self._SPINNER)
+        install_status = f"{self._SPINNER[self._spin]} {self._last_line}"
+        self._tag_redraw(context)
+        return {'PASS_THROUGH'}
+
+    def _finish(self, context):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        self._tag_redraw(context)
+
+    def _tag_redraw(self, context):
+        if context.screen is None:
+            return
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
 
 class SentFromSpacePanel(bpy.types.Panel):
     """Creates a Panel in the Object properties window"""
