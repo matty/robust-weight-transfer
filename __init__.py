@@ -306,9 +306,9 @@ class Inpaint(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         scene_settings: SceneSettingsGroup = context.scene.robust_weight_transfer_settings
-        object_settings: ObjectSettingsGroup = context.active_object.robust_weight_transfer_settings
-        
+
         if not context.active_object: return False
+        object_settings: ObjectSettingsGroup = context.active_object.robust_weight_transfer_settings
         if len(object_settings.inpaint_group) == 0 or object_settings.inpaint_group not in context.active_object.vertex_groups: return False
         
         if scene_settings.use_deformed_target and util.has_modifier(context.active_object, *util.TOPOLOGY_MODS): return False
